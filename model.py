@@ -49,18 +49,23 @@ class SummarizationModel(object):
     self._target_batch = tf.placeholder(tf.int32, [hps.batch_size, hps.max_dec_steps], name='target_batch')
     self._dec_padding_mask = tf.placeholder(tf.float32, [hps.batch_size, hps.max_dec_steps], name='dec_padding_mask')
 
+    # word embedding
+    self.word_embedding = tf.placeholder(tf.float32, [self._vocab.size(), hps.emb_dim], name='word_embedding')
+
     if hps.mode=="decode" and hps.coverage:
       self.prev_coverage = tf.placeholder(tf.float32, [hps.batch_size, None], name='prev_coverage')
 
 
-  def _make_feed_dict(self, batch, just_enc=False):
+  def _make_feed_dict(self, batch, word_embedding, just_enc=False):
     """Make a feed dictionary mapping parts of the batch to the appropriate placeholders.
 
     Args:
       batch: Batch object
+      word_embedding: pre-trained word embedding
       just_enc: Boolean. If True, only feed the parts needed for the encoder.
     """
     feed_dict = {}
+    feed_dict[self.word_embedding] = word_embedding
     feed_dict[self._enc_batch] = batch.enc_batch
     feed_dict[self._enc_lens] = batch.enc_lens
     feed_dict[self._enc_padding_mask] = batch.enc_padding_mask
@@ -209,8 +214,11 @@ class SummarizationModel(object):
 
       # Add embedding matrix (shared by the encoder and decoder inputs)
       with tf.variable_scope('embedding'):
-        embedding = tf.get_variable('embedding', [vsize, hps.emb_dim], dtype=tf.float32, initializer=self.trunc_norm_init)
-        if hps.mode=="train": self._add_emb_vis(embedding) # add to tensorboard
+        # embedding = tf.get_variable('embedding', [vsize, hps.emb_dim], dtype=tf.float32, initializer=self.trunc_norm_init)
+        embedding = tf.Variable(tf.constant(0.0, shape=[vsize, hps.emb_dim]), trainable=False, name="word_embedding_w")
+        embedding_init = embedding.assign(self.word_embedding)
+        if hps.mode == "train":
+          self._add_emb_vis(embedding) # add to tensorboard
         emb_enc_inputs = tf.nn.embedding_lookup(embedding, self._enc_batch) # tensor with shape (batch_size, max_enc_steps, emb_size)
         emb_dec_inputs = [tf.nn.embedding_lookup(embedding, x) for x in tf.unstack(self._dec_batch, axis=1)] # list length max_dec_steps containing shape (batch_size, emb_size)
 
@@ -320,9 +328,9 @@ class SummarizationModel(object):
     t1 = time.time()
     tf.logging.info('Time to build graph: %i seconds', t1 - t0)
 
-  def run_train_step(self, sess, batch):
+  def run_train_step(self, sess, batch, word_embedding):
     """Runs one training iteration. Returns a dictionary containing train op, summaries, loss, global_step and (optionally) coverage loss."""
-    feed_dict = self._make_feed_dict(batch)
+    feed_dict = self._make_feed_dict(batch, word_embedding)
     to_return = {
         'train_op': self._train_op,
         'summaries': self._summaries,

@@ -30,25 +30,26 @@ import util
 from tensorflow.python import debug as tf_debug
 
 FLAGS = tf.app.flags.FLAGS
+TRAIN_STEP = 300000
 
 # Where to find data
-tf.app.flags.DEFINE_string('data_path', '', 'Path expression to tf.Example datafiles. Can include wildcards to access multiple datafiles.')
-tf.app.flags.DEFINE_string('vocab_path', '', 'Path expression to text vocabulary file.')
+tf.app.flags.DEFINE_string('data_path', r'F:\study\topic_summarization\data\chunked\train*', 'Path expression to tf.Example datafiles. Can include wildcards to access multiple datafiles.')
+tf.app.flags.DEFINE_string('vocab_path', r'F:\study\topic_summarization\data\vocab', 'Path expression to text vocabulary file.')
 
 # Important settings
 tf.app.flags.DEFINE_string('mode', 'train', 'must be one of train/eval/decode')
 tf.app.flags.DEFINE_boolean('single_pass', False, 'For decode mode only. If True, run eval on the full dataset using a fixed checkpoint, i.e. take the current checkpoint, and use it to produce one summary for each example in the dataset, write the summaries to file and then get ROUGE scores for the whole dataset. If False (default), run concurrent decoding, i.e. repeatedly load latest checkpoint, use it to produce summaries for randomly-chosen examples and log the results to screen, indefinitely.')
 
 # Where to save output
-tf.app.flags.DEFINE_string('log_root', '', 'Root directory for all logging.')
-tf.app.flags.DEFINE_string('exp_name', '', 'Name for experiment. Logs will be saved in a directory with this name, under log_root.')
+tf.app.flags.DEFINE_string('log_root', r'F:\study\topic_summarization\log', 'Root directory for all logging.')
+tf.app.flags.DEFINE_string('exp_name', 'results', 'Name for experiment. Logs will be saved in a directory with this name, under log_root.')
 
 # Hyperparameters
 tf.app.flags.DEFINE_integer('hidden_dim', 256, 'dimension of RNN hidden states')
-tf.app.flags.DEFINE_integer('emb_dim', 128, 'dimension of word embeddings')
+tf.app.flags.DEFINE_integer('emb_dim', 300, 'dimension of word embeddings')
 tf.app.flags.DEFINE_integer('batch_size', 16, 'minibatch size')
-tf.app.flags.DEFINE_integer('max_enc_steps', 400, 'max timesteps of encoder (max source text tokens)')
-tf.app.flags.DEFINE_integer('max_dec_steps', 100, 'max timesteps of decoder (max summary tokens)')
+tf.app.flags.DEFINE_integer('max_enc_steps', 40, 'max timesteps of encoder (max source text tokens)')
+tf.app.flags.DEFINE_integer('max_dec_steps', 10, 'max timesteps of decoder (max summary tokens)')
 tf.app.flags.DEFINE_integer('beam_size', 4, 'beam size for beam search decoding.')
 tf.app.flags.DEFINE_integer('min_dec_steps', 35, 'Minimum sequence length of generated summary. Applies only for beam search decoding mode')
 tf.app.flags.DEFINE_integer('vocab_size', 50000, 'Size of vocabulary. These will be read from the vocabulary file in order. If the vocabulary file contains fewer words than this number, or if this number is set to 0, will take all words in the vocabulary file.')
@@ -59,7 +60,7 @@ tf.app.flags.DEFINE_float('trunc_norm_init_std', 1e-4, 'std of trunc norm init, 
 tf.app.flags.DEFINE_float('max_grad_norm', 2.0, 'for gradient clipping')
 
 # Pointer-generator or baseline model
-tf.app.flags.DEFINE_boolean('pointer_gen', True, 'If True, use pointer-generator model. If False, use baseline model.')
+tf.app.flags.DEFINE_boolean('pointer_gen', False, 'If True, use pointer-generator model. If False, use baseline model.')
 
 # Coverage hyperparameters
 tf.app.flags.DEFINE_boolean('coverage', False, 'Use coverage mechanism. Note, the experiments reported in the ACL paper train WITHOUT coverage until converged, and then train for a short phase WITH coverage afterwards. i.e. to reproduce the results in the ACL paper, turn this off for most of training then turn on for a short phase at the end.')
@@ -188,12 +189,19 @@ def run_training(model, batcher, sess_context_manager, sv, summary_writer):
     if FLAGS.debug: # start the tensorflow debugger
       sess = tf_debug.LocalCLIDebugWrapperSession(sess)
       sess.add_tensor_filter("has_inf_or_nan", tf_debug.has_inf_or_nan)
-    while True: # repeats until interrupted
+
+    # load pre-trained word embedding
+    t_word_embedding = np.load("word_embedding.npy")
+    tmp_embedding = [np.random.rand(300) for j in range(4)]
+    word_embedding = np.append(t_word_embedding, tmp_embedding, axis=0)
+
+    train_count = 0
+    while train_count<TRAIN_STEP: # repeats until interrupted
       batch = batcher.next_batch()
 
-      tf.logging.info('running training step...')
+      # tf.logging.info('running training step...')
       t0=time.time()
-      results = model.run_train_step(sess, batch)
+      results = model.run_train_step(sess, batch, word_embedding)
       t1=time.time()
       tf.logging.info('seconds for training step: %.3f', t1-t0)
 
@@ -214,6 +222,8 @@ def run_training(model, batcher, sess_context_manager, sv, summary_writer):
       summary_writer.add_summary(summaries, train_step) # write the summaries
       if train_step % 100 == 0: # flush the summary writer every so often
         summary_writer.flush()
+
+      train_count += 1
 
 
 def run_eval(model, batcher, vocab):
