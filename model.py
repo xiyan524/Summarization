@@ -56,7 +56,7 @@ class SummarizationModel(object):
       self.prev_coverage = tf.placeholder(tf.float32, [hps.batch_size, None], name='prev_coverage')
 
 
-  def _make_feed_dict(self, batch, word_embedding, just_enc=False):
+  def _make_feed_dict(self, batch, just_enc=False):
     """Make a feed dictionary mapping parts of the batch to the appropriate placeholders.
 
     Args:
@@ -65,7 +65,6 @@ class SummarizationModel(object):
       just_enc: Boolean. If True, only feed the parts needed for the encoder.
     """
     feed_dict = {}
-    feed_dict[self.word_embedding] = word_embedding
     feed_dict[self._enc_batch] = batch.enc_batch
     feed_dict[self._enc_lens] = batch.enc_lens
     feed_dict[self._enc_padding_mask] = batch.enc_padding_mask
@@ -127,6 +126,37 @@ class SummarizationModel(object):
       return tf.contrib.rnn.LSTMStateTuple(new_c, new_h) # Return new cell and state
 
 
+  def _article_topic_distribution(self, encoder_inputs, hps):
+    """Calculate the distribution of one article among all topics
+    """
+    with tf.variable_scope('article_topic_mapping'):
+      article_representation = tf.reduce_sum(encoder_inputs, axis=1)
+      article_representation = tf.expand_dims(article_representation, axis=-1)
+
+      # topic article mapping
+      W1 = tf.get_variable('w1', [hps.topic_num, hps.emb_dim], dtype=tf.float32, initializer=self.trunc_norm_init)
+      W1 = tf.expand_dims(W1, axis=0)
+      W1 = tf.tile(W1, [hps.batch_size, 1, 1])
+
+      article_topic_distribution = tf.matmul(W1, article_representation)
+
+      return article_topic_distribution
+
+  def _extract_topic_words(self, encoder_inputs, article_topic_distribution, hps):
+    """Extract the topic words from article"""
+    with tf.variable_scope('topic_words'):
+      encoder_inputs = tf.reshape(encoder_inputs, [hps.batch_size, -1, hps.emb_dim])
+
+      # words distribution on every topic
+      W2 = tf.get_variable('w2', [hps.emb_dim, hps.topic_num], dtype=tf.float32, initializer=self.trunc_norm_init)
+      W2 = tf.expand_dims(W2, axis=0)
+      W2 = tf.tile(W2, [hps.batch_size, 1, 1])
+
+      word_topic = tf.matmul(encoder_inputs, W2)
+      word_score = tf.matmul(word_topic, article_topic_distribution)
+
+      return word_score
+
   def _add_decoder(self, inputs):
     """Add attention decoder to the graph. In train or eval mode, you call this once to get output on ALL steps. In decode (beam search) mode, you call this once for EACH decoder step.
 
@@ -145,7 +175,7 @@ class SummarizationModel(object):
 
     prev_coverage = self.prev_coverage if hps.mode=="decode" and hps.coverage else None # In decode mode, we run attention_decoder one step at a time and so need to pass in the previous step's coverage vector each time
 
-    outputs, out_state, attn_dists, p_gens, coverage = attention_decoder(inputs, self._dec_in_state, self._enc_states, self._enc_padding_mask, cell, initial_state_attention=(hps.mode=="decode"), pointer_gen=hps.pointer_gen, use_coverage=hps.coverage, prev_coverage=prev_coverage)
+    outputs, out_state, attn_dists, p_gens, coverage = attention_decoder(inputs, self._dec_in_state, self._enc_states, self._enc_padding_mask, self.topic_words, cell, initial_state_attention=(hps.mode=="decode"), pointer_gen=hps.pointer_gen, use_coverage=hps.coverage, prev_coverage=prev_coverage)
 
     return outputs, out_state, attn_dists, p_gens, coverage
 
@@ -216,11 +246,17 @@ class SummarizationModel(object):
       with tf.variable_scope('embedding'):
         # embedding = tf.get_variable('embedding', [vsize, hps.emb_dim], dtype=tf.float32, initializer=self.trunc_norm_init)
         embedding = tf.Variable(tf.constant(0.0, shape=[vsize, hps.emb_dim]), trainable=False, name="word_embedding_w")
-        embedding_init = embedding.assign(self.word_embedding)
+        self.embedding_init = embedding.assign(self.word_embedding)
         if hps.mode == "train":
           self._add_emb_vis(embedding) # add to tensorboard
         emb_enc_inputs = tf.nn.embedding_lookup(embedding, self._enc_batch) # tensor with shape (batch_size, max_enc_steps, emb_size)
         emb_dec_inputs = [tf.nn.embedding_lookup(embedding, x) for x in tf.unstack(self._dec_batch, axis=1)] # list length max_dec_steps containing shape (batch_size, emb_size)
+
+      # Map article to topic distribution(batch_size, topic_num, 1)
+      self.topic_distribution = self._article_topic_distribution(emb_enc_inputs, hps)
+
+      # Extract topic words(batch_size, seq_num, 1)
+      self.topic_words = self._extract_topic_words(emb_enc_inputs, self.topic_distribution, hps)
 
       # Add the encoder.
       enc_outputs, fw_st, bw_st = self._add_encoder(emb_enc_inputs, self._enc_lens)
@@ -328,9 +364,9 @@ class SummarizationModel(object):
     t1 = time.time()
     tf.logging.info('Time to build graph: %i seconds', t1 - t0)
 
-  def run_train_step(self, sess, batch, word_embedding):
+  def run_train_step(self, sess, batch):
     """Runs one training iteration. Returns a dictionary containing train op, summaries, loss, global_step and (optionally) coverage loss."""
-    feed_dict = self._make_feed_dict(batch, word_embedding)
+    feed_dict = self._make_feed_dict(batch)
     to_return = {
         'train_op': self._train_op,
         'summaries': self._summaries,
@@ -340,6 +376,10 @@ class SummarizationModel(object):
     if self._hps.coverage:
       to_return['coverage_loss'] = self._coverage_loss
     return sess.run(to_return, feed_dict)
+
+  def run_pre_train(self, sess, word_embedding):
+    """Run pre_trained word embedding assignment"""
+    sess.run(self.embedding_init, feed_dict={self.word_embedding: word_embedding})
 
   def run_eval_step(self, sess, batch):
     """Runs one evaluation iteration. Returns a dictionary containing summaries, loss, global_step and (optionally) coverage loss."""
