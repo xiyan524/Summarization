@@ -20,6 +20,8 @@ import os
 import time
 import numpy as np
 import tensorflow as tf
+from tensorflow.python.ops import nn_ops
+from collections import Counter
 from attention_decoder import attention_decoder
 from tensorflow.contrib.tensorboard.plugins import projector
 
@@ -32,6 +34,22 @@ class SummarizationModel(object):
     self._hps = hps
     self._vocab = vocab
 
+    self.beta = tf.get_variable("beta", [hps.topic_num, self._vocab.size()], initializer=tf.ones_initializer)
+    self.beta = self.beta / hps.topic_num
+
+    # mu: The mean of the variational distribution.
+    self.w_mu = tf.get_variable("w_mu", [hps.topic_dim], initializer=tf.random_uniform_initializer)
+    self.a_mu = tf.get_variable("a_mu", [hps.topic_num], initializer=tf.random_uniform_initializer)
+
+    # sigma: The root standard deviation of the variational distribution.
+    self.w_sigma = tf.get_variable("w_sigma", [hps.topic_dim], initializer=tf.random_uniform_initializer)
+    self.a_sigma = tf.get_variable("a_sigma", [hps.topic_num], initializer=tf.random_uniform_initializer)
+
+    # noise: used for sampling
+    # self.noise = tfp.distributions.MultivariateNormalDiag(tf.zeros(hps.topic_dim), tf.diag(tf.zeros(hps.topic_dim)))
+    self.noise = tf.contrib.distributions.MultivariateNormalFullCovariance(tf.zeros(hps.topic_num), tf.diag(tf.ones(hps.topic_num)))
+
+
   def _add_placeholders(self):
     """Add placeholders to the graph. These are entry points for any input data."""
     hps = self._hps
@@ -40,6 +58,7 @@ class SummarizationModel(object):
     self._enc_batch = tf.placeholder(tf.int32, [hps.batch_size, None], name='enc_batch')
     self._enc_lens = tf.placeholder(tf.int32, [hps.batch_size], name='enc_lens')
     self._enc_padding_mask = tf.placeholder(tf.float32, [hps.batch_size, None], name='enc_padding_mask')
+    self._enc_term_frequency = tf.placeholder(tf.int32, [hps.batch_size, self._vocab.size()], name='word_term_frequency')
     if FLAGS.pointer_gen:
       self._enc_batch_extend_vocab = tf.placeholder(tf.int32, [hps.batch_size, None], name='enc_batch_extend_vocab')
       self._max_art_oovs = tf.placeholder(tf.int32, [], name='max_art_oovs')
@@ -56,7 +75,7 @@ class SummarizationModel(object):
       self.prev_coverage = tf.placeholder(tf.float32, [hps.batch_size, None], name='prev_coverage')
 
 
-  def _make_feed_dict(self, batch, just_enc=False):
+  def _make_feed_dict(self, batch, word_term_frequencty, just_enc=False):
     """Make a feed dictionary mapping parts of the batch to the appropriate placeholders.
 
     Args:
@@ -68,6 +87,7 @@ class SummarizationModel(object):
     feed_dict[self._enc_batch] = batch.enc_batch
     feed_dict[self._enc_lens] = batch.enc_lens
     feed_dict[self._enc_padding_mask] = batch.enc_padding_mask
+    feed_dict[self._enc_term_frequency] = word_term_frequencty
     if FLAGS.pointer_gen:
       feed_dict[self._enc_batch_extend_vocab] = batch.enc_batch_extend_vocab
       feed_dict[self._max_art_oovs] = batch.max_art_oovs
@@ -142,6 +162,7 @@ class SummarizationModel(object):
 
       return article_topic_distribution
 
+
   def _extract_topic_words(self, encoder_inputs, article_topic_distribution, hps):
     """Extract the topic words from article"""
     with tf.variable_scope('topic_words'):
@@ -156,6 +177,7 @@ class SummarizationModel(object):
       word_score = tf.matmul(word_topic, article_topic_distribution)
 
       return word_score
+
 
   def _add_decoder(self, inputs):
     """Add attention decoder to the graph. In train or eval mode, you call this once to get output on ALL steps. In decode (beam search) mode, you call this once for EACH decoder step.
@@ -178,6 +200,7 @@ class SummarizationModel(object):
     outputs, out_state, attn_dists, p_gens, coverage = attention_decoder(inputs, self._dec_in_state, self._enc_states, self._enc_padding_mask, self.topic_words, cell, initial_state_attention=(hps.mode=="decode"), pointer_gen=hps.pointer_gen, use_coverage=hps.coverage, prev_coverage=prev_coverage)
 
     return outputs, out_state, attn_dists, p_gens, coverage
+
 
   def _calc_final_dist(self, vocab_dists, attn_dists):
     """Calculate the final distribution, for the pointer-generator model
@@ -218,6 +241,70 @@ class SummarizationModel(object):
 
       return final_dists
 
+
+  def _compute_word_frequency_vector(self, encoder_inputs, hps):
+    """Calculate the word frequency representation."""
+    batch_size = hps.batch_size
+    term_frequency_matrix = np.zeros([batch_size, self._vocab.size()]) # reserve word frequency in an article
+
+    for i, words in enumerate(encoder_inputs):
+      word_counts = dict(Counter(words))
+      for word, count in word_counts.items():
+        term_frequency_matrix[i][word] = count
+
+    return term_frequency_matrix
+
+
+  def _map_term_frequency(self, hps):
+    """Map word term frequency to representation(calculation of X_c)"""
+    with tf.variable_scope('word_frequency_mapping'):
+      w_wtm = tf.get_variable('w_wtm', [self._vocab.size(), hps.hidden_dim])
+      tmp_mapping = tf.matmul(tf.cast(self._enc_term_frequency, tf.float32), w_wtm)
+
+      w_wtm1 = tf.get_variable('w_wtm1', [hps.hidden_dim, hps.topic_dim * hps.topic_num])
+      mapped_term_frequencies = tf.matmul(tmp_mapping, w_wtm1)
+
+      return mapped_term_frequencies
+
+
+  def _cal_topic_representation(self, mapped_term_frequencies, hps):
+    """Calculate the topic representation of article"""
+    mapped_term_frequencies = tf.reshape(mapped_term_frequencies, [hps.batch_size, hps.topic_dim, -1])
+
+    # mu and sigma of current article distribution
+    w_mu_tmp = tf.expand_dims(tf.expand_dims(self.w_mu, axis=0), axis=0)
+    w_mu_tmp = tf.tile(w_mu_tmp, [hps.batch_size, 1, 1])
+    mu = tf.matmul(w_mu_tmp, mapped_term_frequencies) + self.a_mu
+    mu = tf.squeeze(mu)
+
+    w_sigma_tmp = tf.expand_dims(tf.expand_dims(self.w_sigma, axis=0), axis=0)
+    w_sigma_tmp = tf.tile(w_sigma_tmp, [hps.batch_size, 1, 1])
+    log_sigma = tf.matmul(w_sigma_tmp, mapped_term_frequencies) + self.a_sigma
+    log_sigma = tf.squeeze(log_sigma)
+
+    # compute KL-Divergence
+    kl_divergence = tf.ones(tf.shape(mu)) + 2 * log_sigma - (mu ** 2) - (tf.exp(log_sigma) ** 2)
+
+    # Sum along the topic dimension and add const.
+    kl_divergence = tf.reduce_sum(kl_divergence) / 2
+    kl_divergence = kl_divergence / hps.batch_size
+
+
+    return mu, log_sigma, kl_divergence
+
+
+  def _topic_representation(self, mu, log_sigma):
+    """Get noisy parameters randomly, and produce topic representation"""
+    # get noise
+    epsilon = self.noise.sample()
+
+    # use noise to generate topic parameters distribution
+    theta = mu + tf.exp(log_sigma) * epsilon
+    topic_additions = tf.matmul(theta, self.beta)
+
+    return topic_additions
+
+
   def _add_emb_vis(self, embedding_var):
     """Do setup so that we can view word embedding visualization in Tensorboard, as described here:
     https://www.tensorflow.org/get_started/embedding_viz
@@ -231,6 +318,7 @@ class SummarizationModel(object):
     embedding.tensor_name = embedding_var.name
     embedding.metadata_path = vocab_metadata_path
     projector.visualize_embeddings(summary_writer, config)
+
 
   def _add_seq2seq(self):
     """Add the whole sequence-to-sequence model to the graph."""
@@ -258,6 +346,13 @@ class SummarizationModel(object):
       # Extract topic words(batch_size, seq_num, 1)
       self.topic_words = self._extract_topic_words(emb_enc_inputs, self.topic_distribution, hps)
 
+      # calculate final results based on topic_representation
+      mapped_term_frequencies = self._map_term_frequency(hps)
+      mu, log_sigma, kl_divergence = self._cal_topic_representation(mapped_term_frequencies, hps)
+
+      # get article topic representation
+      topic_additions = self._topic_representation(mu, log_sigma)
+
       # Add the encoder.
       enc_outputs, fw_st, bw_st = self._add_encoder(emb_enc_inputs, self._enc_lens)
       self._enc_states = enc_outputs
@@ -272,13 +367,16 @@ class SummarizationModel(object):
       # Add the output projection to obtain the vocabulary distribution
       with tf.variable_scope('output_projection'):
         w = tf.get_variable('w', [hps.hidden_dim, vsize], dtype=tf.float32, initializer=self.trunc_norm_init)
-        w_t = tf.transpose(w)
         v = tf.get_variable('v', [vsize], dtype=tf.float32, initializer=self.trunc_norm_init)
         vocab_scores = [] # vocab_scores is the vocabulary distribution before applying softmax. Each entry on the list corresponds to one decoder step
         for i,output in enumerate(decoder_outputs):
           if i > 0:
             tf.get_variable_scope().reuse_variables()
-          vocab_scores.append(tf.nn.xw_plus_b(output, w, v)) # apply the linear layer
+          tmp_topic_addition = tf.slice(topic_additions, [i, 0], [1, vsize])
+          topic_filter = tf.slice(tf.squeeze(self.topic_words), [0, i], [hps.batch_size, 1])
+          logits = tf.nn.xw_plus_b(output, w, v)
+          semantic = tf.multiply(topic_filter, tmp_topic_addition)
+          vocab_scores.append(logits + semantic) # apply the linear layer
 
         vocab_dists = [tf.nn.softmax(s) for s in vocab_scores] # The vocabulary distributions. List length max_dec_steps of (batch_size, vsize) arrays. The words are in the order they appear in the vocabulary file.
 
@@ -311,6 +409,7 @@ class SummarizationModel(object):
 
           else: # baseline model
             self._loss = tf.contrib.seq2seq.sequence_loss(tf.stack(vocab_scores, axis=1), self._target_batch, self._dec_padding_mask) # this applies softmax internally
+            self._loss = self._loss - kl_divergence
 
           tf.summary.scalar('loss', self._loss)
 
@@ -364,9 +463,12 @@ class SummarizationModel(object):
     t1 = time.time()
     tf.logging.info('Time to build graph: %i seconds', t1 - t0)
 
+
   def run_train_step(self, sess, batch):
     """Runs one training iteration. Returns a dictionary containing train op, summaries, loss, global_step and (optionally) coverage loss."""
-    feed_dict = self._make_feed_dict(batch)
+    word_term_frequencty = self._compute_word_frequency_vector(batch.enc_batch, self._hps)
+
+    feed_dict = self._make_feed_dict(batch, word_term_frequencty)
     to_return = {
         'train_op': self._train_op,
         'summaries': self._summaries,
@@ -377,9 +479,11 @@ class SummarizationModel(object):
       to_return['coverage_loss'] = self._coverage_loss
     return sess.run(to_return, feed_dict)
 
+
   def run_pre_train(self, sess, word_embedding):
     """Run pre_trained word embedding assignment"""
     sess.run(self.embedding_init, feed_dict={self.word_embedding: word_embedding})
+
 
   def run_eval_step(self, sess, batch):
     """Runs one evaluation iteration. Returns a dictionary containing summaries, loss, global_step and (optionally) coverage loss."""
@@ -392,6 +496,7 @@ class SummarizationModel(object):
     if self._hps.coverage:
       to_return['coverage_loss'] = self._coverage_loss
     return sess.run(to_return, feed_dict)
+
 
   def run_encoder(self, sess, batch):
     """For beam search decoding. Run the encoder on the batch and return the encoder states and decoder initial state.
